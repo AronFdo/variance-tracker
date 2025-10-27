@@ -8,16 +8,18 @@ import {
   GoogleAuthProvider,
   signInWithPopup
 } from 'firebase/auth';
-import { auth } from './config';
+import { auth, db } from './config';
+import { doc, setDoc, serverTimestamp } from 'firebase/firestore';
 
 /**
  * Register a new user with email and password
  * @param {string} email - User's email
  * @param {string} password - User's password
  * @param {string} displayName - User's display name
+ * @param {string} portal - Portal type ('hr' or 'staff') to determine role
  * @returns {Promise<UserCredential>}
  */
-export const registerWithEmail = async (email, password, displayName = '') => {
+export const registerWithEmail = async (email, password, displayName = '', portal = 'staff') => {
   try {
     const userCredential = await createUserWithEmailAndPassword(auth, email, password);
     
@@ -26,6 +28,20 @@ export const registerWithEmail = async (email, password, displayName = '') => {
       await updateProfile(userCredential.user, { displayName });
     }
     
+    // Determine role based on portal
+    const role = portal === 'hr' ? 'hr' : 'staff';
+    
+    // Create user profile document with role
+    const user = userCredential.user;
+    await setDoc(doc(db, 'users', user.uid), {
+      uid: user.uid,
+      email: user.email,
+      displayName: displayName || user.displayName || '',
+      role: role,
+      createdAt: serverTimestamp(),
+      updatedAt: serverTimestamp()
+    });
+
     return userCredential;
   } catch (error) {
     throw error;

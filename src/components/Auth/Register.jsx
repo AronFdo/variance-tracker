@@ -37,7 +37,8 @@ const Register = ({ onToggleMode }) => {
     setLoading(true);
 
     try {
-      await registerWithEmail(formData.email, formData.password, formData.displayName);
+      // Register as HR admin (since this is the HR portal)
+      await registerWithEmail(formData.email, formData.password, formData.displayName, 'hr');
     } catch (err) {
       setError(err.message);
     } finally {
@@ -63,7 +64,7 @@ const Register = ({ onToggleMode }) => {
       <h2>Sign Up</h2>
       {error && <div className="error-message">{error}</div>}
       
-      <form onSubmit={handleSubmit}>
+      <form onSubmit={handleSubmit} noValidate>
         <div className="form-group">
           <label htmlFor="displayName">Display Name</label>
           <input
@@ -73,8 +74,10 @@ const Register = ({ onToggleMode }) => {
             value={formData.displayName}
             onChange={handleChange}
             disabled={loading}
+            autoComplete="name"
           />
         </div>
+
 
         <div className="form-group">
           <label htmlFor="email">Email</label>
@@ -86,6 +89,8 @@ const Register = ({ onToggleMode }) => {
             onChange={handleChange}
             required
             disabled={loading}
+            autoComplete="email"
+            inputMode="email"
           />
         </div>
 
@@ -100,6 +105,7 @@ const Register = ({ onToggleMode }) => {
             required
             disabled={loading}
             minLength={6}
+            autoComplete="new-password"
           />
         </div>
 
@@ -114,6 +120,7 @@ const Register = ({ onToggleMode }) => {
             required
             disabled={loading}
             minLength={6}
+            autoComplete="new-password"
           />
         </div>
 

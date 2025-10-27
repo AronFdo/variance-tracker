@@ -39,7 +39,7 @@ const Login = ({ onToggleMode }) => {
       <h2>Sign In</h2>
       {error && <div className="error-message">{error}</div>}
       
-      <form onSubmit={handleSubmit}>
+      <form onSubmit={handleSubmit} noValidate>
         <div className="form-group">
           <label htmlFor="email">Email</label>
           <input
@@ -49,6 +49,8 @@ const Login = ({ onToggleMode }) => {
             onChange={(e) => setEmail(e.target.value)}
             required
             disabled={loading}
+            autoComplete="email"
+            inputMode="email"
           />
         </div>
 
@@ -61,6 +63,7 @@ const Login = ({ onToggleMode }) => {
             onChange={(e) => setPassword(e.target.value)}
             required
             disabled={loading}
+            autoComplete="current-password"
           />
         </div>
 

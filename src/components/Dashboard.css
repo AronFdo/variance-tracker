@@ -115,4 +115,7 @@
   }
 }
 
+/* Tailwind-based HR layout is now used in Dashboard.jsx; these legacy
+   styles remain for other components that might reference them. */
+
 
