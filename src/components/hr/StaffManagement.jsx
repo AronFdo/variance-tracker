@@ -1,4 +1,6 @@
 import { useMemo, useState, useEffect } from 'react';
+import { registerWithEmail } from '../../firebase/auth';
+import { createStaffProfile } from '../../firebase/firestore';
 
 const initialStaff = [
   { 
@@ -253,10 +255,79 @@ const generateStaffSchedule = (staffList, month, year, clientFilter = null, real
       const realAssignment = realAssignments[assignmentKey];
       
       // If real assignment exists, use it instead of mock data
-      if (realAssignment && realAssignment.assignments) {
-        const dayData = processRealAssignment(realAssignment, clientsToSchedule, clientFilter);
-        schedule[staffId][day] = dayData;
-        continue;
+      if (realAssignment) {
+        if (realAssignment.hourBreakdown) {
+          // New format: direct hour breakdown
+          const { hourBreakdown } = realAssignment;
+          const allHours = [];
+          
+          // Generate hourly breakdown for visualization
+          let billedCompletedCount = 0;
+          let unbilledCompletedCount = 0;
+          let billedPendingCount = 0;
+          let unbilledPendingCount = 0;
+          
+          for (let hour = 9; hour < 17; hour++) {
+            const totalAssigned = hourBreakdown.billedAssigned + hourBreakdown.unbilledAssigned;
+            const totalCompleted = hourBreakdown.billedCompleted + hourBreakdown.unbilledCompleted;
+            const hourIndex = hour - 9;
+            const isCompleted = hourIndex < totalCompleted;
+            const isAssigned = hourIndex < totalAssigned;
+            
+            let status = 'unassigned';
+            let billingStatus = 'unbilled';
+            
+            if (isCompleted) {
+              status = 'completed';
+              if (billedCompletedCount < hourBreakdown.billedCompleted) {
+                billingStatus = 'billed';
+                billedCompletedCount++;
+              } else {
+                billingStatus = 'unbilled';
+                unbilledCompletedCount++;
+              }
+            } else if (isAssigned) {
+              status = 'pending';
+              if ((billedCompletedCount + billedPendingCount) < hourBreakdown.billedAssigned) {
+                billingStatus = 'billed';
+                billedPendingCount++;
+              } else {
+                billingStatus = 'unbilled';
+                unbilledPendingCount++;
+              }
+            }
+            
+            allHours.push({
+              hour,
+              assigned: isAssigned,
+              completed: isCompleted,
+              status,
+              billingStatus,
+              combinedStatus: billingStatus === 'billed'
+                ? (status === 'completed' ? 'billed-completed' : 'billed-assigned')
+                : (status === 'completed' ? 'unbilled-completed' : status === 'pending' ? 'unbilled-assigned' : 'unassigned')
+            });
+          }
+          
+          schedule[staffId][day] = {
+            billedAssigned: hourBreakdown.billedAssigned,
+            billedCompleted: hourBreakdown.billedCompleted,
+            unbilledAssigned: hourBreakdown.unbilledAssigned,
+            unbilledCompleted: hourBreakdown.unbilledCompleted,
+            totalAssigned: hourBreakdown.billedAssigned + hourBreakdown.unbilledAssigned,
+            totalCompleted: hourBreakdown.billedCompleted + hourBreakdown.unbilledCompleted,
+            variance: (hourBreakdown.billedCompleted + hourBreakdown.unbilledCompleted) - (hourBreakdown.billedAssigned + hourBreakdown.unbilledAssigned),
+            unbilledVariance: hourBreakdown.unbilledCompleted - hourBreakdown.unbilledAssigned,
+            hours: allHours,
+            byClient: {} // Simplified for direct hour breakdown
+          };
+          continue;
+        } else if (realAssignment.assignments) {
+          // Old format: client-based assignments (keep for backward compatibility)
+          const dayData = processRealAssignment(realAssignment, clientsToSchedule, clientFilter);
+          schedule[staffId][day] = dayData;
+          continue;
+        }
       }
       
       // Skip weekends for most staff
@@ -419,6 +490,7 @@ export default function StaffManagement() {
   const [selectedMonth, setSelectedMonth] = useState(new Date());
   const [staffSchedule, setStaffSchedule] = useState({});
   const [selectedClientFilter, setSelectedClientFilter] = useState('all'); // 'all' or specific client name
+  const [calendarViewMode, setCalendarViewMode] = useState('list'); // 'calendar' or 'list'
   
   // Hour assignment state
   const [hourAssignments, setHourAssignments] = useState({}); // Store manual hour assignments
@@ -486,15 +558,51 @@ export default function StaffManagement() {
     return data;
   }, [filtered, sortBy]);
 
-  const openAdd = () => setModal({ type: 'add', open: true, payload: { name: '', project: '', billedHours: 0, actualHours: 0, rate: 0 } });
+  const openAdd = () => setModal({ type: 'add', open: true, payload: { name: '', email: '', password: '', project: '', rate: 40 } });
   const openEdit = (row) => setModal({ type: 'edit', open: true, payload: { ...row } });
   const openDelete = (row) => setModal({ type: 'delete', open: true, payload: { ...row } });
   const closeModal = () => setModal({ type: null, open: false, payload: null });
 
-  const confirmAddOrEdit = () => {
+  const confirmAddOrEdit = async () => {
     if (modal.type === 'add') {
-      const id = `s${Date.now()}`;
-      setStaff(prev => [...prev, { ...modal.payload, id }]);
+      try {
+        const { name, email, password, rate, project } = modal.payload;
+        if (!email || !password || !name) {
+          alert('Name, email, and password are required.');
+          return;
+        }
+        // Create Firebase Auth user
+        const cred = await registerWithEmail(email, password, name, 'staff');
+        const uid = cred.user.uid;
+
+        // Create Firestore staff profile
+        await createStaffProfile(uid, {
+          email,
+          displayName: name,
+          rate: Number(rate) || 40,
+          clients: project ? [{ name: project, rate: Number(rate) || 40 }] : [],
+          status: 'active'
+        });
+
+        // Update local UI list
+        setStaff(prev => [
+          ...prev,
+          {
+            id: uid,
+            name,
+            project: project || 'Unassigned',
+            billedHours: 0,
+            actualHours: 0,
+            rate: Number(rate) || 40,
+            email,
+            clients: project ? [{ name: project, rate: Number(rate) || 40 }] : []
+          }
+        ]);
+      } catch (e) {
+        console.error(e);
+        alert(e.message || 'Failed to create staff user.');
+        return;
+      }
     } else if (modal.type === 'edit') {
       setStaff(prev => prev.map(s => (s.id === modal.payload.id ? modal.payload : s)));
     }
@@ -535,11 +643,14 @@ export default function StaffManagement() {
     const assignmentKey = `${staffId}_${dateStr}`;
     const existingAssignment = hourAssignments[assignmentKey];
     
+    // Ensure date is a proper Date object
+    const dateObj = date instanceof Date ? date : new Date(date);
+    
     setSelectedAssignment({
       staffId,
       staffName: staffMember.name,
       date: dateStr,
-      dateObj: date,
+      dateObj: dateObj,
       clients: staffMember.clients || [{ name: staffMember.project, rate: staffMember.rate }],
       existingData: existingAssignment || null
     });
@@ -548,7 +659,7 @@ export default function StaffManagement() {
   
   // Save hour assignment
   const saveHourAssignment = (assignmentData) => {
-    const { staffId, date, assignments } = assignmentData;
+    const { staffId, date, hourBreakdown } = assignmentData;
     const assignmentKey = `${staffId}_${date}`;
     
     setHourAssignments(prev => ({
@@ -556,7 +667,7 @@ export default function StaffManagement() {
       [assignmentKey]: {
         staffId,
         date,
-        assignments, // Array of { client, hours: [9, 10, 11...], billingStatus }
+        hourBreakdown, // Object with billedAssigned, billedCompleted, unbilledAssigned, unbilledCompleted
         lastModified: new Date().toISOString()
       }
     }));
@@ -758,19 +869,45 @@ export default function StaffManagement() {
                 </button>
               </div>
               
-              {/* Client Filter */}
-              <div className="flex items-center gap-3">
-                <label className="text-sm font-medium text-gray-700">Filter by Client:</label>
-                <select
-                  value={selectedClientFilter}
-                  onChange={(e) => setSelectedClientFilter(e.target.value)}
-                  className="rounded-md border border-gray-300 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-blue-500 bg-white min-w-[180px]"
-                >
-                  <option value="all">All Clients</option>
-                  {allClients.map(client => (
-                    <option key={client} value={client}>{client}</option>
-                  ))}
-                </select>
+              <div className="flex flex-col sm:flex-row items-start sm:items-center gap-3">
+                {/* View Toggle */}
+                <div className="flex items-center gap-2 bg-gray-100 rounded-lg p-1">
+                  <button
+                    onClick={() => setCalendarViewMode('list')}
+                    className={`px-3 py-1.5 text-sm font-medium rounded-md transition-colors ${
+                      calendarViewMode === 'list'
+                        ? 'bg-white text-blue-600 shadow-sm'
+                        : 'text-gray-600 hover:text-gray-900'
+                    }`}
+                  >
+                    📋 List View
+                  </button>
+                  <button
+                    onClick={() => setCalendarViewMode('calendar')}
+                    className={`px-3 py-1.5 text-sm font-medium rounded-md transition-colors ${
+                      calendarViewMode === 'calendar'
+                        ? 'bg-white text-blue-600 shadow-sm'
+                        : 'text-gray-600 hover:text-gray-900'
+                    }`}
+                  >
+                    📅 Calendar View
+                  </button>
+                </div>
+                
+                {/* Client Filter */}
+                <div className="flex items-center gap-3">
+                  <label className="text-sm font-medium text-gray-700">Filter by Client:</label>
+                  <select
+                    value={selectedClientFilter}
+                    onChange={(e) => setSelectedClientFilter(e.target.value)}
+                    className="rounded-md border border-gray-300 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-blue-500 bg-white min-w-[180px]"
+                  >
+                    <option value="all">All Clients</option>
+                    {allClients.map(client => (
+                      <option key={client} value={client}>{client}</option>
+                    ))}
+                  </select>
+                </div>
               </div>
             </div>
             
@@ -891,147 +1028,247 @@ export default function StaffManagement() {
                   </div>
                 </div>
 
-                {/* Calendar Grid */}
-                <div className="p-4 overflow-x-auto">
-                  <div className="min-w-max">
-                    {/* Day headers */}
-                    <div className="grid grid-cols-7 gap-1 mb-2">
-                      {['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'].map(day => (
-                        <div key={day} className="text-center text-xs font-semibold text-gray-500 uppercase w-32">
-                          {day}
+                {/* Calendar or List View */}
+                {calendarViewMode === 'calendar' ? (
+                  /* Calendar Grid */
+                  <div className="p-4 overflow-x-auto">
+                    <div className="min-w-max">
+                      {/* Day headers */}
+                      <div className="grid grid-cols-7 gap-1 mb-2">
+                        {['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'].map(day => (
+                          <div key={day} className="text-center text-xs font-semibold text-gray-500 uppercase w-32">
+                            {day}
+                          </div>
+                        ))}
+                      </div>
+
+                      {/* Calendar weeks */}
+                      {getCalendarData.map((week, weekIdx) => (
+                        <div key={weekIdx} className="grid grid-cols-7 gap-1 mb-1">
+                          {week.map((dayData, dayIdx) => {
+                            if (!dayData) {
+                              return <div key={dayIdx} className="w-32 h-32 bg-gray-50 rounded"></div>;
+                            }
+
+                            const daySchedule = schedule[dayData.day] || { 
+                              billedAssigned: 0, 
+                              billedCompleted: 0, 
+                              unbilledAssigned: 0, 
+                              unbilledCompleted: 0,
+                              totalAssigned: 0,
+                              totalCompleted: 0,
+                              variance: 0,
+                              unbilledVariance: 0,
+                              hours: [] 
+                            };
+                            const isWeekend = dayData.dayOfWeek === 0 || dayData.dayOfWeek === 6;
+                            const isToday = dayData.date.toDateString() === new Date().toDateString();
+
+                            const assignmentKey = `${staffMember.id}_${dayData.date.toISOString().split('T')[0]}`;
+                            const hasAssignment = hourAssignments[assignmentKey];
+                            
+                            return (
+                              <div 
+                                key={dayIdx} 
+                                onClick={() => openAssignModal(staffMember.id, dayData.date)}
+                                className={`w-32 h-32 border rounded p-1 cursor-pointer transition-all ${
+                                  isToday ? 'border-blue-500 border-2' : 'border-gray-200'
+                                } ${isWeekend ? 'bg-gray-50' : 'bg-white'} ${
+                                  hasAssignment ? 'ring-2 ring-green-300' : 'hover:border-blue-400 hover:shadow-md'
+                                }`}
+                              >
+                                {/* Day number */}
+                                <div className="flex justify-between items-start mb-1">
+                                  <div className="flex items-center gap-1">
+                                    <span className={`text-xs font-semibold ${
+                                      isToday ? 'text-blue-600' : 'text-gray-700'
+                                    }`}>
+                                      {dayData.day}
+                                    </span>
+                                    {hasAssignment && (
+                                      <span className="text-green-600" title="Has manual assignments">
+                                        <svg className="h-3 w-3" fill="currentColor" viewBox="0 0 20 20">
+                                          <path fillRule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zm3.707-9.293a1 1 0 00-1.414-1.414L9 10.586 7.707 9.293a1 1 0 00-1.414 1.414l2 2a1 1 0 001.414 0l4-4z" clipRule="evenodd" />
+                                        </svg>
+                                      </span>
+                                    )}
+                                  </div>
+                                  {daySchedule.variance !== 0 && (
+                                    <span className={`text-xs font-bold ${
+                                      daySchedule.variance > 0 ? 'text-green-600' : 'text-red-600'
+                                    }`}>
+                                      {daySchedule.variance > 0 ? '+' : ''}{daySchedule.variance}
+                                    </span>
+                                  )}
+                                </div>
+
+                                {/* Hours visualization */}
+                                {daySchedule.totalAssigned > 0 && (
+                                  <div className="space-y-0.5">
+                                    {/* Hourly slots */}
+                                    <div className="grid grid-cols-8 gap-0.5">
+                                      {daySchedule.hours.map((hourData, idx) => (
+                                        <div
+                                          key={idx}
+                                          className={`h-2 rounded-sm ${
+                                            hourData.combinedStatus === 'billed-completed'
+                                              ? 'bg-blue-500' 
+                                              : hourData.combinedStatus === 'billed-assigned'
+                                              ? 'bg-blue-300'
+                                              : hourData.combinedStatus === 'unbilled-completed'
+                                              ? 'bg-green-500'
+                                              : hourData.combinedStatus === 'unbilled-assigned'
+                                              ? 'bg-yellow-400'
+                                              : 'bg-gray-200'
+                                          }`}
+                                          title={`${hourData.hour}:00 - ${hourData.combinedStatus.replace('-', ' ')}`}
+                                        ></div>
+                                      ))}
+                                    </div>
+
+                                    {/* Summary text */}
+                                    <div className="text-xs text-gray-600 space-y-0.5">
+                                      <div className="flex justify-between">
+                                        <span className="font-medium text-blue-600">BA: {daySchedule.billedAssigned}h</span>
+                                        <span className="font-bold text-blue-700">BC: {daySchedule.billedCompleted}h</span>
+                                      </div>
+                                      <div className="flex justify-between">
+                                        <span className="font-medium text-yellow-600">UA: {daySchedule.unbilledAssigned}h</span>
+                                        <span className="font-bold text-green-600">UC: {daySchedule.unbilledCompleted}h</span>
+                                      </div>
+                                      {daySchedule.unbilledVariance !== 0 && (
+                                        <div className="text-center">
+                                          <span className={`text-xs font-bold ${
+                                            daySchedule.unbilledVariance > 0 ? 'text-green-600' : 'text-red-600'
+                                          }`}>
+                                            V: {daySchedule.unbilledVariance > 0 ? '+' : ''}{daySchedule.unbilledVariance}h
+                                          </span>
+                                        </div>
+                                      )}
+                                      
+                                      {/* Per-client breakdown for multi-client view */}
+                                      {selectedClientFilter === 'all' && daySchedule.byClient && Object.keys(daySchedule.byClient).length > 1 && (
+                                        <div className="pt-0.5 mt-0.5 border-t border-gray-200 space-y-0.5">
+                                          {Object.entries(daySchedule.byClient).map(([clientName, clientData]) => (
+                                            <div key={clientName} className="flex justify-between items-center">
+                                              <span className="text-gray-500 truncate max-w-[60px]" title={clientName}>
+                                                {clientName.substring(0, 8)}:
+                                              </span>
+                                              <span className="font-medium text-purple-600">
+                                                {clientData.totalCompleted}h
+                                              </span>
+                                            </div>
+                                          ))}
+                                        </div>
+                                      )}
+                                    </div>
+                                  </div>
+                                )}
+                              </div>
+                            );
+                          })}
                         </div>
                       ))}
                     </div>
-
-                    {/* Calendar weeks */}
-                    {getCalendarData.map((week, weekIdx) => (
-                      <div key={weekIdx} className="grid grid-cols-7 gap-1 mb-1">
-                        {week.map((dayData, dayIdx) => {
-                          if (!dayData) {
-                            return <div key={dayIdx} className="w-32 h-32 bg-gray-50 rounded"></div>;
-                          }
-
-                          const daySchedule = schedule[dayData.day] || { 
-                            billedAssigned: 0, 
-                            billedCompleted: 0, 
-                            unbilledAssigned: 0, 
+                  </div>
+                ) : (
+                  /* List View */
+                  <div className="p-4">
+                    <div className="bg-white border rounded-lg overflow-hidden">
+                      {/* Header */}
+                      <div className="grid grid-cols-12 gap-4 bg-gray-50 border-b px-6 py-3 text-sm font-semibold text-gray-700">
+                        <div className="col-span-2">Date</div>
+                        <div className="col-span-2 text-center">Billed/Assigned</div>
+                        <div className="col-span-2 text-center">Billed/Completed</div>
+                        <div className="col-span-2 text-center">Unbilled/Assigned</div>
+                        <div className="col-span-2 text-center">Unbilled/Completed</div>
+                        <div className="col-span-2 text-center">Variance</div>
+                      </div>
+                      
+                      {/* Days List */}
+                      <div className="divide-y divide-gray-200">
+                        {Array.from({ length: daysInMonth }, (_, i) => i + 1).map(day => {
+                          const date = new Date(selectedMonth.getFullYear(), selectedMonth.getMonth(), day);
+                          const dayOfWeek = date.getDay();
+                          const daySchedule = schedule[day] || {
+                            billedAssigned: 0,
+                            billedCompleted: 0,
+                            unbilledAssigned: 0,
                             unbilledCompleted: 0,
                             totalAssigned: 0,
                             totalCompleted: 0,
                             variance: 0,
                             unbilledVariance: 0,
-                            hours: [] 
+                            hours: []
                           };
-                          const isWeekend = dayData.dayOfWeek === 0 || dayData.dayOfWeek === 6;
-                          const isToday = dayData.date.toDateString() === new Date().toDateString();
-
-                          const assignmentKey = `${staffMember.id}_${dayData.date.toISOString().split('T')[0]}`;
-                          const hasAssignment = hourAssignments[assignmentKey];
                           
+                          const isWeekend = dayOfWeek === 0 || dayOfWeek === 6;
+                          const isToday = date.toDateString() === new Date().toDateString();
+                          const assignmentKey = `${staffMember.id}_${date.toISOString().split('T')[0]}`;
+                          const hasAssignment = hourAssignments[assignmentKey];
+
                           return (
-                            <div 
-                              key={dayIdx} 
-                              onClick={() => openAssignModal(staffMember.id, dayData.date)}
-                              className={`w-32 h-32 border rounded p-1 cursor-pointer transition-all ${
-                                isToday ? 'border-blue-500 border-2' : 'border-gray-200'
-                              } ${isWeekend ? 'bg-gray-50' : 'bg-white'} ${
-                                hasAssignment ? 'ring-2 ring-green-300' : 'hover:border-blue-400 hover:shadow-md'
-                              }`}
+                            <div
+                              key={day}
+                              onClick={() => openAssignModal(staffMember.id, date)}
+                              className={`grid grid-cols-12 gap-4 px-6 py-4 text-sm hover:bg-blue-50 cursor-pointer transition-colors ${
+                                isToday ? 'bg-blue-50 border-l-4 border-blue-600' : ''
+                              } ${isWeekend ? 'bg-gray-50' : ''}`}
                             >
-                              {/* Day number */}
-                              <div className="flex justify-between items-start mb-1">
-                                <div className="flex items-center gap-1">
-                                  <span className={`text-xs font-semibold ${
-                                    isToday ? 'text-blue-600' : 'text-gray-700'
-                                  }`}>
-                                    {dayData.day}
-                                  </span>
-                                  {hasAssignment && (
-                                    <span className="text-green-600" title="Has manual assignments">
-                                      <svg className="h-3 w-3" fill="currentColor" viewBox="0 0 20 20">
-                                        <path fillRule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zm3.707-9.293a1 1 0 00-1.414-1.414L9 10.586 7.707 9.293a1 1 0 00-1.414 1.414l2 2a1 1 0 001.414 0l4-4z" clipRule="evenodd" />
-                                      </svg>
-                                    </span>
-                                  )}
-                                </div>
-                                {daySchedule.variance !== 0 && (
-                                  <span className={`text-xs font-bold ${
-                                    daySchedule.variance > 0 ? 'text-green-600' : 'text-red-600'
-                                  }`}>
-                                    {daySchedule.variance > 0 ? '+' : ''}{daySchedule.variance}
+                              {/* Date */}
+                              <div className="col-span-2 flex items-center gap-2">
+                                <span className={`font-semibold ${isToday ? 'text-blue-600' : 'text-gray-900'}`}>
+                                  {day}
+                                </span>
+                                <span className="text-xs text-gray-500">
+                                  {date.toLocaleDateString('en-US', { weekday: 'short' })}
+                                </span>
+                                {hasAssignment && (
+                                  <span className="text-green-600" title="Has manual assignments">
+                                    <svg className="h-4 w-4" fill="currentColor" viewBox="0 0 20 20">
+                                      <path fillRule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zm3.707-9.293a1 1 0 00-1.414-1.414L9 10.586 7.707 9.293a1 1 0 00-1.414 1.414l2 2a1 1 0 001.414 0l4-4z" clipRule="evenodd" />
+                                    </svg>
                                   </span>
                                 )}
                               </div>
-
-                              {/* Hours visualization */}
-                              {daySchedule.totalAssigned > 0 && (
-                                <div className="space-y-0.5">
-                                  {/* Hourly slots */}
-                                  <div className="grid grid-cols-8 gap-0.5">
-                                    {daySchedule.hours.map((hourData, idx) => (
-                                      <div
-                                        key={idx}
-                                        className={`h-2 rounded-sm ${
-                                          hourData.combinedStatus === 'billed-completed'
-                                            ? 'bg-blue-500' 
-                                            : hourData.combinedStatus === 'billed-assigned'
-                                            ? 'bg-blue-300'
-                                            : hourData.combinedStatus === 'unbilled-completed'
-                                            ? 'bg-green-500'
-                                            : hourData.combinedStatus === 'unbilled-assigned'
-                                            ? 'bg-yellow-400'
-                                            : 'bg-gray-200'
-                                        }`}
-                                        title={`${hourData.hour}:00 - ${hourData.combinedStatus.replace('-', ' ')}`}
-                                      ></div>
-                                    ))}
-                                  </div>
-
-                                  {/* Summary text */}
-                                  <div className="text-xs text-gray-600 space-y-0.5">
-                                    <div className="flex justify-between">
-                                      <span className="font-medium text-blue-600">BA: {daySchedule.billedAssigned}h</span>
-                                      <span className="font-bold text-blue-700">BC: {daySchedule.billedCompleted}h</span>
-                                    </div>
-                                    <div className="flex justify-between">
-                                      <span className="font-medium text-yellow-600">UA: {daySchedule.unbilledAssigned}h</span>
-                                      <span className="font-bold text-green-600">UC: {daySchedule.unbilledCompleted}h</span>
-                                    </div>
-                                    {daySchedule.unbilledVariance !== 0 && (
-                                      <div className="text-center">
-                                        <span className={`text-xs font-bold ${
-                                          daySchedule.unbilledVariance > 0 ? 'text-green-600' : 'text-red-600'
-                                        }`}>
-                                          V: {daySchedule.unbilledVariance > 0 ? '+' : ''}{daySchedule.unbilledVariance}h
-                                        </span>
-                                      </div>
-                                    )}
-                                    
-                                    {/* Per-client breakdown for multi-client view */}
-                                    {selectedClientFilter === 'all' && daySchedule.byClient && Object.keys(daySchedule.byClient).length > 1 && (
-                                      <div className="pt-0.5 mt-0.5 border-t border-gray-200 space-y-0.5">
-                                        {Object.entries(daySchedule.byClient).map(([clientName, clientData]) => (
-                                          <div key={clientName} className="flex justify-between items-center">
-                                            <span className="text-gray-500 truncate max-w-[60px]" title={clientName}>
-                                              {clientName.substring(0, 8)}:
-                                            </span>
-                                            <span className="font-medium text-purple-600">
-                                              {clientData.totalCompleted}h
-                                            </span>
-                                          </div>
-                                        ))}
-                                      </div>
-                                    )}
-                                  </div>
-                                </div>
-                              )}
+                              
+                              {/* Billed/Assigned */}
+                              <div className="col-span-2 text-center">
+                                <span className="font-semibold text-blue-300">{daySchedule.billedAssigned}h</span>
+                              </div>
+                              
+                              {/* Billed/Completed */}
+                              <div className="col-span-2 text-center">
+                                <span className="font-bold text-blue-600">{daySchedule.billedCompleted}h</span>
+                              </div>
+                              
+                              {/* Unbilled/Assigned */}
+                              <div className="col-span-2 text-center">
+                                <span className="font-semibold text-yellow-500">{daySchedule.unbilledAssigned}h</span>
+                              </div>
+                              
+                              {/* Unbilled/Completed */}
+                              <div className="col-span-2 text-center">
+                                <span className="font-bold text-green-600">{daySchedule.unbilledCompleted}h</span>
+                              </div>
+                              
+                              {/* Variance */}
+                              <div className="col-span-2 text-center">
+                                {daySchedule.variance !== 0 && (
+                                  <span className={`font-bold ${
+                                    daySchedule.variance > 0 ? 'text-green-600' : 'text-red-600'
+                                  }`}>
+                                    {daySchedule.variance > 0 ? '+' : ''}{daySchedule.variance}h
+                                  </span>
+                                )}
+                              </div>
                             </div>
                           );
                         })}
                       </div>
-                    ))}
+                    </div>
                   </div>
-                </div>
+                )}
 
                 {/* Staff Summary Footer */}
                 <div className="bg-gray-50 border-t px-6 py-4">
@@ -1283,20 +1520,23 @@ export default function StaffManagement() {
                 <h3 className="text-lg font-semibold">{modal.type === 'add' ? 'Add Staff' : 'Edit Staff'}</h3>
                 <div className="mt-4 grid grid-cols-1 sm:grid-cols-2 gap-4">
                   <div>
-                    <label className="block text-sm text-gray-600">Name</label>
+                    <label className="block text-sm text-gray-600">Full Name</label>
                     <input value={modal.payload.name} onChange={(e) => setModal(m => ({ ...m, payload: { ...m.payload, name: e.target.value } }))} className="mt-1 w-full rounded-md border px-3 py-2 text-sm" />
                   </div>
                   <div>
-                    <label className="block text-sm text-gray-600">Project/Client</label>
-                    <input value={modal.payload.project} onChange={(e) => setModal(m => ({ ...m, payload: { ...m.payload, project: e.target.value } }))} className="mt-1 w-full rounded-md border px-3 py-2 text-sm" />
+                    <label className="block text-sm text-gray-600">Email</label>
+                    <input type="email" value={modal.payload.email || ''} onChange={(e) => setModal(m => ({ ...m, payload: { ...m.payload, email: e.target.value } }))} className="mt-1 w-full rounded-md border px-3 py-2 text-sm" />
                   </div>
+                  {modal.type === 'add' && (
+                    <div className="sm:col-span-2">
+                      <label className="block text-sm text-gray-600">Temporary Password</label>
+                      <input type="password" value={modal.payload.password || ''} onChange={(e) => setModal(m => ({ ...m, payload: { ...m.payload, password: e.target.value } }))} className="mt-1 w-full rounded-md border px-3 py-2 text-sm" />
+                      <p className="mt-1 text-xs text-gray-500">They can change this after first login.</p>
+                    </div>
+                  )}
                   <div>
-                    <label className="block text-sm text-gray-600">Billed Hours</label>
-                    <input type="number" value={modal.payload.billedHours} onChange={(e) => setModal(m => ({ ...m, payload: { ...m.payload, billedHours: Number(e.target.value) } }))} className="mt-1 w-full rounded-md border px-3 py-2 text-sm" />
-                  </div>
-                  <div>
-                    <label className="block text-sm text-gray-600">Actual Hours</label>
-                    <input type="number" value={modal.payload.actualHours} onChange={(e) => setModal(m => ({ ...m, payload: { ...m.payload, actualHours: Number(e.target.value) } }))} className="mt-1 w-full rounded-md border px-3 py-2 text-sm" />
+                    <label className="block text-sm text-gray-600">Primary Client</label>
+                    <input value={modal.payload.project || ''} onChange={(e) => setModal(m => ({ ...m, payload: { ...m.payload, project: e.target.value } }))} className="mt-1 w-full rounded-md border px-3 py-2 text-sm" />
                   </div>
                   <div>
                     <label className="block text-sm text-gray-600">Rate ($/hr)</label>
@@ -1333,78 +1573,38 @@ export default function StaffManagement() {
 function HourAssignmentModal({ assignment, onSave, onDelete, onClose }) {
   const { staffId, staffName, date, dateObj, clients, existingData } = assignment;
   
-  // Initialize state from existing data or create new
-  const [clientAssignments, setClientAssignments] = useState(() => {
-    if (existingData && existingData.assignments) {
-      return existingData.assignments;
+  // Initialize state with hour breakdown
+  const [hourBreakdown, setHourBreakdown] = useState(() => {
+    if (existingData && existingData.hourBreakdown) {
+      return existingData.hourBreakdown;
     }
-    // Default: one empty assignment
-    return [{ client: clients[0]?.name || '', hours: [], billingStatus: 'unbilled' }];
+    return {
+      billedAssigned: 0,
+      billedCompleted: 0,
+      unbilledAssigned: 0,
+      unbilledCompleted: 0
+    };
   });
   
-  const availableHours = [9, 10, 11, 12, 13, 14, 15, 16]; // 9 AM to 5 PM (8 hours)
-  
-  // Add new client assignment
-  const addClientAssignment = () => {
-    setClientAssignments(prev => [
+  // Update hour breakdown
+  const updateHourBreakdown = (field, value) => {
+    setHourBreakdown(prev => ({
       ...prev,
-      { client: clients[0]?.name || '', hours: [], billingStatus: 'unbilled' }
-    ]);
-  };
-  
-  // Remove client assignment
-  const removeClientAssignment = (index) => {
-    setClientAssignments(prev => prev.filter((_, i) => i !== index));
-  };
-  
-  // Update client assignment
-  const updateClientAssignment = (index, field, value) => {
-    setClientAssignments(prev => prev.map((assignment, i) => 
-      i === index ? { ...assignment, [field]: value } : assignment
-    ));
-  };
-  
-  // Toggle hour selection
-  const toggleHour = (assignmentIndex, hour) => {
-    setClientAssignments(prev => prev.map((assignment, i) => {
-      if (i !== assignmentIndex) return assignment;
-      
-      const hours = assignment.hours.includes(hour)
-        ? assignment.hours.filter(h => h !== hour)
-        : [...assignment.hours, hour].sort((a, b) => a - b);
-      
-      return { ...assignment, hours };
+      [field]: Math.max(0, Math.min(8, value))
     }));
   };
   
-  // Check if hour is already assigned to another client in this day
-  const isHourAssigned = (currentIndex, hour) => {
-    return clientAssignments.some((assignment, i) => 
-      i !== currentIndex && assignment.hours.includes(hour)
-    );
-  };
-  
-  // Calculate total hours
-  const totalAssignedHours = clientAssignments.reduce((sum, assignment) => 
-    sum + assignment.hours.length, 0
-  );
+  // Calculate totals
+  const totalAssigned = hourBreakdown.billedAssigned + hourBreakdown.unbilledAssigned;
+  const totalCompleted = hourBreakdown.billedCompleted + hourBreakdown.unbilledCompleted;
+  const variance = totalCompleted - totalAssigned;
   
   // Save assignments
   const handleSave = () => {
-    // Filter out empty assignments
-    const validAssignments = clientAssignments.filter(a => 
-      a.client && a.hours.length > 0
-    );
-    
-    if (validAssignments.length === 0) {
-      alert('Please assign at least one hour to a client');
-      return;
-    }
-    
     onSave({
       staffId,
       date,
-      assignments: validAssignments
+      hourBreakdown
     });
   };
   
@@ -1423,9 +1623,9 @@ function HourAssignmentModal({ assignment, onSave, onDelete, onClose }) {
         <div className="sticky top-0 bg-gradient-to-r from-blue-50 to-indigo-50 border-b px-6 py-4">
           <div className="flex justify-between items-start">
             <div>
-              <h3 className="text-xl font-semibold text-gray-900">Assign Hours</h3>
+              <h3 className="text-xl font-semibold text-gray-900">Edit Hour Specifications</h3>
               <p className="text-sm text-gray-600 mt-1">
-                {staffName} • {new Date(dateObj).toLocaleDateString('en-US', { 
+                {staffName} • {dateObj.toLocaleDateString('en-US', { 
                   weekday: 'long', 
                   year: 'numeric', 
                   month: 'long', 
@@ -1448,142 +1648,93 @@ function HourAssignmentModal({ assignment, onSave, onDelete, onClose }) {
         <div className="p-6">
           {/* Summary */}
           <div className="mb-6 p-4 bg-blue-50 border border-blue-200 rounded-lg">
-            <div className="flex justify-between items-center">
-              <span className="text-sm font-medium text-gray-700">
-                Total Hours Assigned:
-              </span>
-              <span className={`text-lg font-bold ${
-                totalAssignedHours > 8 ? 'text-red-600' : 
-                totalAssignedHours === 8 ? 'text-green-600' : 'text-blue-600'
-              }`}>
-                {totalAssignedHours} / 8 hours
-              </span>
+            <div className="grid grid-cols-2 gap-4">
+              <div>
+                <span className="text-sm font-medium text-gray-700">Total Assigned:</span>
+                <span className={`ml-2 text-lg font-bold ${
+                  totalAssigned > 8 ? 'text-red-600' : 'text-blue-600'
+                }`}>
+                  {totalAssigned}h
+                </span>
+              </div>
+              <div>
+                <span className="text-sm font-medium text-gray-700">Variance:</span>
+                <span className={`ml-2 text-lg font-bold ${
+                  variance > 0 ? 'text-green-600' : variance < 0 ? 'text-red-600' : 'text-gray-600'
+                }`}>
+                  {variance > 0 ? '+' : ''}{variance}h
+                </span>
+              </div>
             </div>
-            {totalAssignedHours > 8 && (
-              <p className="text-xs text-red-600 mt-1">
+            {totalAssigned > 8 && (
+              <p className="text-xs text-red-600 mt-2">
                 ⚠️ Warning: More than 8 hours assigned
               </p>
             )}
           </div>
           
-          {/* Client Assignments */}
+          {/* Hour Breakdown Input */}
           <div className="space-y-6">
-            {clientAssignments.map((assignment, index) => {
-              const selectedClient = clients.find(c => c.name === assignment.client);
-              
-              return (
-                <div key={index} className="border border-gray-200 rounded-lg p-4 bg-gray-50">
-                  <div className="flex justify-between items-start mb-4">
-                    <h4 className="font-semibold text-gray-900">
-                      Assignment #{index + 1}
-                    </h4>
-                    {clientAssignments.length > 1 && (
-                      <button
-                        onClick={() => removeClientAssignment(index)}
-                        className="text-red-600 hover:text-red-800 text-sm font-medium"
-                      >
-                        Remove
-                      </button>
-                    )}
-                  </div>
-                  
-                  {/* Client Selection */}
-                  <div className="mb-4">
-                    <label className="block text-sm font-medium text-gray-700 mb-2">
-                      Client
-                    </label>
-                    <select
-                      value={assignment.client}
-                      onChange={(e) => updateClientAssignment(index, 'client', e.target.value)}
-                      className="w-full rounded-md border border-gray-300 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
-                    >
-                      <option value="">Select a client...</option>
-                      {clients.map(client => (
-                        <option key={client.name} value={client.name}>
-                          {client.name} (${client.rate}/hr)
-                        </option>
-                      ))}
-                    </select>
-                  </div>
-                  
-                  {/* Billing Status */}
-                  <div className="mb-4">
-                    <label className="block text-sm font-medium text-gray-700 mb-2">
-                      Billing Status
-                    </label>
-                    <div className="flex gap-4">
-                      <label className="flex items-center">
-                        <input
-                          type="radio"
-                          checked={assignment.billingStatus === 'unbilled'}
-                          onChange={() => updateClientAssignment(index, 'billingStatus', 'unbilled')}
-                          className="mr-2"
-                        />
-                        <span className="text-sm text-gray-700">Unbilled</span>
-                      </label>
-                      <label className="flex items-center">
-                        <input
-                          type="radio"
-                          checked={assignment.billingStatus === 'billed'}
-                          onChange={() => updateClientAssignment(index, 'billingStatus', 'billed')}
-                          className="mr-2"
-                        />
-                        <span className="text-sm text-gray-700">Pre-billed</span>
-                      </label>
-                    </div>
-                  </div>
-                  
-                  {/* Hour Selection */}
-                  <div>
-                    <label className="block text-sm font-medium text-gray-700 mb-2">
-                      Select Hours ({assignment.hours.length} selected)
-                    </label>
-                    <div className="grid grid-cols-4 gap-2">
-                      {availableHours.map(hour => {
-                        const isSelected = assignment.hours.includes(hour);
-                        const isAssignedElsewhere = isHourAssigned(index, hour);
-                        const timeStr = hour === 12 ? '12 PM' : hour > 12 ? `${hour - 12} PM` : `${hour} AM`;
-                        
-                        return (
-                          <button
-                            key={hour}
-                            onClick={() => !isAssignedElsewhere && toggleHour(index, hour)}
-                            disabled={isAssignedElsewhere}
-                            className={`px-3 py-2 rounded-md text-sm font-medium transition-colors ${
-                              isSelected
-                                ? 'bg-blue-600 text-white hover:bg-blue-700'
-                                : isAssignedElsewhere
-                                ? 'bg-gray-200 text-gray-400 cursor-not-allowed'
-                                : 'bg-white border border-gray-300 text-gray-700 hover:bg-gray-50'
-                            }`}
-                          >
-                            {timeStr}
-                          </button>
-                        );
-                      })}
-                    </div>
-                    {assignment.hours.length > 0 && (
-                      <p className="text-xs text-gray-600 mt-2">
-                        Selected: {assignment.hours.map(h => 
-                          h === 12 ? '12 PM' : h > 12 ? `${h - 12} PM` : `${h} AM`
-                        ).join(', ')}
-                      </p>
-                    )}
-                  </div>
-                </div>
-              );
-            })}
+            {/* Billed Assigned */}
+            <div className="border-l-4 border-blue-300 bg-blue-50 p-4 rounded">
+              <label className="block text-sm font-semibold text-gray-800 mb-3">
+                💙 Billed/Assigned (Hours pre-billed to client and assigned to staff)
+              </label>
+              <input
+                type="number"
+                min="0"
+                max="8"
+                value={hourBreakdown.billedAssigned}
+                onChange={(e) => updateHourBreakdown('billedAssigned', parseInt(e.target.value) || 0)}
+                className="w-full rounded-md border border-blue-300 bg-white px-4 py-3 text-2xl font-bold text-blue-600 focus:outline-none focus:ring-2 focus:ring-blue-500"
+              />
+            </div>
+
+            {/* Billed Completed */}
+            <div className="border-l-4 border-blue-600 bg-blue-50 p-4 rounded">
+              <label className="block text-sm font-semibold text-gray-800 mb-3">
+                🔵 Billed/Completed (Hours pre-billed to client and completed by staff)
+              </label>
+              <input
+                type="number"
+                min="0"
+                max="8"
+                value={hourBreakdown.billedCompleted}
+                onChange={(e) => updateHourBreakdown('billedCompleted', parseInt(e.target.value) || 0)}
+                className="w-full rounded-md border border-blue-600 bg-white px-4 py-3 text-2xl font-bold text-blue-700 focus:outline-none focus:ring-2 focus:ring-blue-700"
+              />
+            </div>
+
+            {/* Unbilled Assigned */}
+            <div className="border-l-4 border-yellow-400 bg-yellow-50 p-4 rounded">
+              <label className="block text-sm font-semibold text-gray-800 mb-3">
+                🟡 Unbilled/Assigned (Hours assigned but not yet billed to client)
+              </label>
+              <input
+                type="number"
+                min="0"
+                max="8"
+                value={hourBreakdown.unbilledAssigned}
+                onChange={(e) => updateHourBreakdown('unbilledAssigned', parseInt(e.target.value) || 0)}
+                className="w-full rounded-md border border-yellow-400 bg-white px-4 py-3 text-2xl font-bold text-yellow-600 focus:outline-none focus:ring-2 focus:ring-yellow-500"
+              />
+            </div>
+
+            {/* Unbilled Completed */}
+            <div className="border-l-4 border-green-500 bg-green-50 p-4 rounded">
+              <label className="block text-sm font-semibold text-gray-800 mb-3">
+                🟢 Unbilled/Completed (Hours completed but not yet billed to client)
+              </label>
+              <input
+                type="number"
+                min="0"
+                max="8"
+                value={hourBreakdown.unbilledCompleted}
+                onChange={(e) => updateHourBreakdown('unbilledCompleted', parseInt(e.target.value) || 0)}
+                className="w-full rounded-md border border-green-500 bg-white px-4 py-3 text-2xl font-bold text-green-600 focus:outline-none focus:ring-2 focus:ring-green-500"
+              />
+            </div>
           </div>
-          
-          {/* Add Another Client Button */}
-          {clients.length > 1 && (
-            <button
-              onClick={addClientAssignment}
-              className="mt-4 w-full py-2 border-2 border-dashed border-gray-300 rounded-lg text-sm font-medium text-gray-600 hover:border-blue-400 hover:text-blue-600 transition-colors"
-            >
-              + Add Another Client
-            </button>
-          )}
         </div>
         
         {/* Footer */}
